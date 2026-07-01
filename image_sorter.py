@@ -59,6 +59,7 @@ from PySide6.QtWidgets import (
 APP_NAME = "Image Sorter"
 MAX_FOLDERS = 200
 GROUP_MIME = "application/x-imagesorter-group"   # drag payload: a group id
+FOLDER_MIME = "application/x-imagesorter-folders"  # drag payload: folder ids (csv)
 BATCH_LIMIT = 10          # max folders addable in one "Add folders" session
 MAX_GROUP_DEPTH = 4       # how deep groups may nest (Books > Action > ... )
 BIG_FILE_BYTES = 8 * 1024 * 1024   # show per-file % and chunked copy above this
@@ -103,7 +104,16 @@ DEFAULT_SETTINGS = {
     "media_only": True,        # if True, non-media (non image/video) files are skipped
     "confirm_each": False,     # if True, ask before every drop
     "auto_check_seconds": 20,  # how often to re-check reachability
+    "background_image": "",    # optional home-screen wallpaper path
 }
+
+
+def decode_folder_ids(mime):
+    """Folder ids carried by a folder-tile drag, or []."""
+    if mime.hasFormat(FOLDER_MIME):
+        raw = bytes(mime.data(FOLDER_MIME)).decode("utf-8")
+        return [x for x in raw.split(",") if x]
+    return []
 
 
 # --------------------------------------------------------------------------- #
@@ -291,6 +301,33 @@ def rounded_cover_pixmap(src: QPixmap, w: int, h: int, radius: int) -> QPixmap:
     path.addRoundedRect(0, 0, w, h, radius, radius)
     p.setClipPath(path)
     p.drawPixmap(0, 0, src)
+    p.end()
+    return out
+
+
+def _drag_badge(base: QPixmap, count: int) -> QPixmap:
+    """Overlay a small count badge on a drag pixmap when dragging several tiles."""
+    if count <= 1:
+        return base
+    out = QPixmap(base.size())
+    out.fill(Qt.transparent)
+    p = QPainter(out)
+    p.setRenderHint(QPainter.Antialiasing, True)
+    p.setOpacity(0.9)
+    p.drawPixmap(0, 0, base)
+    p.setOpacity(1.0)
+    d = 26
+    x = out.width() - d - 4
+    y = 4
+    p.setBrush(QColor("#2563eb"))
+    p.setPen(QColor("#0e1116"))
+    p.drawEllipse(x, y, d, d)
+    f = QFont()
+    f.setBold(True)
+    f.setPointSize(11)
+    p.setFont(f)
+    p.setPen(QColor("#ffffff"))
+    p.drawText(QRect(x, y, d, d), Qt.AlignCenter, str(count))
     p.end()
     return out
 
@@ -517,6 +554,7 @@ class DropTile(QFrame):
     addToGroupRequested = Signal(object, str)   # (Mapping, group id)
     newGroupForRequested = Signal(object)
     refreshCoverRequested = Signal(object)
+    foldersDroppedOnFolder = Signal(list, object)   # (dragged folder ids, target Mapping)
 
     def __init__(self, mapping: Mapping):
         super().__init__()
@@ -526,6 +564,9 @@ class DropTile(QFrame):
         self.selected = False
         self._hover_drag = False
         self._has_cover = False
+        self._press_pos = None
+        self._press_ctrl = False
+        self.drag_ids_provider = None   # callable(mid) -> [ids], set by the window
         self.available_groups = []   # set by the window before refresh
 
         self.setObjectName("tile")
@@ -683,21 +724,59 @@ class DropTile(QFrame):
     # ---- events ----
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
-            if e.modifiers() & Qt.ControlModifier:
-                self.ctrlClicked.emit(self.mapping)
-            else:
-                self.clicked.emit(self.mapping)
+            self._press_pos = e.position().toPoint()
+            self._press_ctrl = bool(e.modifiers() & Qt.ControlModifier)
+            if self._press_ctrl:
+                self.ctrlClicked.emit(self.mapping)   # toggle selection now
         super().mousePressEvent(e)
 
+    def mouseMoveEvent(self, e):
+        if ((e.buttons() & Qt.LeftButton) and self._press_pos is not None
+                and not self._press_ctrl):
+            moved = (e.position().toPoint() - self._press_pos).manhattanLength()
+            if moved >= QApplication.startDragDistance():
+                ids = []
+                if self.drag_ids_provider:
+                    ids = self.drag_ids_provider(self.mapping.id)
+                if not ids:
+                    ids = [self.mapping.id]
+                drag = QDrag(self)
+                mime = QMimeData()
+                mime.setData(FOLDER_MIME, ",".join(ids).encode("utf-8"))
+                drag.setMimeData(mime)
+                drag.setPixmap(_drag_badge(self.grab(), len(ids)))
+                drag.setHotSpot(e.position().toPoint())
+                self._press_pos = None
+                drag.exec(Qt.MoveAction)
+                return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if (e.button() == Qt.LeftButton and self._press_pos is not None
+                and not self._press_ctrl):
+            self.clicked.emit(self.mapping)   # plain click (no drag) -> set active
+        self._press_pos = None
+        super().mouseReleaseEvent(e)
+
+    def _accepts_folder_drop(self, md):
+        ids = decode_folder_ids(md)
+        return bool(ids) and self.mapping.id not in ids
+
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
+        md = e.mimeData()
+        if md.hasUrls() or self._accepts_folder_drop(md):
             e.acceptProposedAction()
             self._hover_drag = True
             self._apply_border()
+        else:
+            e.ignore()
 
     def dragMoveEvent(self, e):
-        if e.mimeData().hasUrls():
+        md = e.mimeData()
+        if md.hasUrls() or self._accepts_folder_drop(md):
             e.acceptProposedAction()
+        else:
+            e.ignore()
 
     def dragLeaveEvent(self, e):
         self._hover_drag = False
@@ -706,10 +785,19 @@ class DropTile(QFrame):
     def dropEvent(self, e):
         self._hover_drag = False
         self._apply_border()
-        paths = extract_local_files(e.mimeData())
-        if paths:
+        md = e.mimeData()
+        if md.hasUrls():
+            paths = extract_local_files(md)
+            if paths:
+                e.acceptProposedAction()
+                self.filesDropped.emit(self.mapping, paths)
+            return
+        ids = decode_folder_ids(md)
+        if ids and self.mapping.id not in ids:
             e.acceptProposedAction()
-            self.filesDropped.emit(self.mapping, paths)
+            self.foldersDroppedOnFolder.emit(ids, self.mapping)
+            return
+        e.ignore()
 
     def _show_menu(self, pos):
         menu = QMenu(self)
@@ -769,6 +857,7 @@ class GroupTile(QFrame):
     moveUpRequested = Signal(object)
     moveTopRequested = Signal(object)
     reparentRequested = Signal(str, str)    # source group id, target (new parent) id
+    foldersDroppedOnGroup = Signal(list, object)   # (dragged folder ids, this Group)
 
     def __init__(self, group: "Group"):
         super().__init__()
@@ -881,26 +970,29 @@ class GroupTile(QFrame):
                 return
         super().mouseMoveEvent(e)
 
-    # ---- drop target (accept a group dropped onto this one) ----
+    # ---- drop target (accept a group OR folders dropped onto this one) ----
     def _dragged_group(self, e):
         md = e.mimeData()
         if md.hasFormat(GROUP_MIME):
             return bytes(md.data(GROUP_MIME)).decode("utf-8")
         return None
 
+    def _group_ok(self, src):
+        return bool(src) and src != self.group.id and (
+            self.validate_drop is None or self.validate_drop(src, self.group.id))
+
+    def _folders_ok(self, e):
+        return bool(decode_folder_ids(e.mimeData()))
+
     def dragEnterEvent(self, e):
-        src = self._dragged_group(e)
-        if src and src != self.group.id and (
-                self.validate_drop is None or self.validate_drop(src, self.group.id)):
+        if self._group_ok(self._dragged_group(e)) or self._folders_ok(e):
             e.acceptProposedAction()
             self._set_drop_hover(True)
         else:
             e.ignore()
 
     def dragMoveEvent(self, e):
-        src = self._dragged_group(e)
-        if src and src != self.group.id and (
-                self.validate_drop is None or self.validate_drop(src, self.group.id)):
+        if self._group_ok(self._dragged_group(e)) or self._folders_ok(e):
             e.acceptProposedAction()
         else:
             e.ignore()
@@ -911,11 +1003,16 @@ class GroupTile(QFrame):
     def dropEvent(self, e):
         self._set_drop_hover(False)
         src = self._dragged_group(e)
-        if src and src != self.group.id:
+        if self._group_ok(src):
             e.acceptProposedAction()
             self.reparentRequested.emit(src, self.group.id)
-        else:
-            e.ignore()
+            return
+        ids = decode_folder_ids(e.mimeData())
+        if ids:
+            e.acceptProposedAction()
+            self.foldersDroppedOnGroup.emit(ids, self.group)
+            return
+        e.ignore()
 
     def _menu(self, pos):
         menu = QMenu(self)
@@ -944,7 +1041,8 @@ class GroupTile(QFrame):
 # A button that also accepts a dragged group (for un-nesting via drag-and-drop)
 # --------------------------------------------------------------------------- #
 class GroupDropButton(QPushButton):
-    groupDropped = Signal(str)   # the dragged group's id
+    groupDropped = Signal(str)     # the dragged group's id
+    foldersDropped = Signal(list)  # dragged folder ids
 
     def __init__(self, text):
         super().__init__(text)
@@ -956,14 +1054,17 @@ class GroupDropButton(QPushButton):
             return bytes(md.data(GROUP_MIME)).decode("utf-8")
         return None
 
+    def _accepts(self, e):
+        return bool(self._gid(e)) or bool(decode_folder_ids(e.mimeData()))
+
     def dragEnterEvent(self, e):
-        if self._gid(e):
+        if self._accepts(e):
             e.acceptProposedAction()
         else:
             e.ignore()
 
     def dragMoveEvent(self, e):
-        if self._gid(e):
+        if self._accepts(e):
             e.acceptProposedAction()
         else:
             e.ignore()
@@ -973,8 +1074,13 @@ class GroupDropButton(QPushButton):
         if gid:
             e.acceptProposedAction()
             self.groupDropped.emit(gid)
-        else:
-            e.ignore()
+            return
+        ids = decode_folder_ids(e.mimeData())
+        if ids:
+            e.acceptProposedAction()
+            self.foldersDropped.emit(ids)
+            return
+        e.ignore()
 
 
 # --------------------------------------------------------------------------- #
@@ -1735,10 +1841,46 @@ class SettingsDialog(QDialog):
         self.interval.setValue(int(settings.get("auto_check_seconds", 20)))
         form.addRow("Auto re-check drives every (0 = off)", self.interval)
 
+        self._bg_path = settings.get("background_image", "") or ""
+        bg_row = QHBoxLayout()
+        self.bg_label = QLabel()
+        self.bg_label.setObjectName("activeHint")
+        choose = QPushButton("Choose\u2026")
+        choose.clicked.connect(self._choose_bg)
+        clear = QPushButton("Clear")
+        clear.clicked.connect(self._clear_bg)
+        bg_row.addWidget(self.bg_label, 1)
+        bg_row.addWidget(choose, 0)
+        bg_row.addWidget(clear, 0)
+        form.addRow("Home background", bg_row)
+        self._refresh_bg_label()
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+
+    def _refresh_bg_label(self):
+        if self._bg_path:
+            fm = QFontMetrics(self.bg_label.font())
+            self.bg_label.setText(fm.elidedText(
+                os.path.basename(self._bg_path), Qt.ElideMiddle, 220))
+            self.bg_label.setToolTip(self._bg_path)
+        else:
+            self.bg_label.setText("(none)")
+            self.bg_label.setToolTip("")
+
+    def _choose_bg(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a background image", os.path.expanduser("~"),
+            "Images (*.png *.jpg *.jpeg *.bmp *.webp *.gif *.tif *.tiff)")
+        if path:
+            self._bg_path = os.path.normpath(path)
+            self._refresh_bg_label()
+
+    def _clear_bg(self):
+        self._bg_path = ""
+        self._refresh_bg_label()
 
     def values(self):
         return {
@@ -1746,6 +1888,7 @@ class SettingsDialog(QDialog):
             "media_only": self.media_only.isChecked(),
             "confirm_each": self.confirm_each.isChecked(),
             "auto_check_seconds": self.interval.value(),
+            "background_image": self._bg_path,
         }
 
 
@@ -1849,6 +1992,42 @@ class TransferProgressDialog(QDialog):
 
 
 # --------------------------------------------------------------------------- #
+# Home-screen wallpaper backdrop (paints behind the tile canvas)
+# --------------------------------------------------------------------------- #
+class WallpaperWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("wallpaper")
+        self.setAttribute(Qt.WA_StyledBackground, False)
+        self._pixmap = None
+        self._scaled = None
+        self._scaled_for = None
+        self._base = QColor("#0e1116")
+
+    def set_wallpaper(self, pixmap):
+        self._pixmap = pixmap if (pixmap and not pixmap.isNull()) else None
+        self._scaled = None
+        self._scaled_for = None
+        self.update()
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        r = self.rect()
+        if self._pixmap is not None:
+            if self._scaled is None or self._scaled_for != r.size():
+                self._scaled = self._pixmap.scaled(
+                    r.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+                self._scaled_for = r.size()
+            sx = max(0, (self._scaled.width() - r.width()) // 2)
+            sy = max(0, (self._scaled.height() - r.height()) // 2)
+            p.drawPixmap(r, self._scaled, QRect(sx, sy, r.width(), r.height()))
+            p.fillRect(r, QColor(10, 12, 18, 150))   # scrim for tile readability
+        else:
+            p.fillRect(r, self._base)
+        p.end()
+
+
+# --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
 class MainWindow(QMainWindow):
@@ -1882,6 +2061,7 @@ class MainWindow(QMainWindow):
         self.thumbs.signals.result.connect(self._on_thumb)
 
         self._build_ui()
+        self._apply_wallpaper()
         self._rebuild_grid()
         self._update_active_zone()
         self.recheck_all()
@@ -1967,12 +2147,14 @@ class MainWindow(QMainWindow):
         self.up_btn = GroupDropButton("\u2191  Up")
         self.up_btn.clicked.connect(self.go_up)
         self.up_btn.groupDropped.connect(self._drop_group_up)
-        self.up_btn.setToolTip("Go up \u00b7 or drop a group here to move it up a level")
+        self.up_btn.foldersDropped.connect(self._drop_folders_up)
+        self.up_btn.setToolTip("Go up \u00b7 or drop groups/folders here to move them up a level")
         cl.addWidget(self.up_btn, 0)
         self.home_btn = GroupDropButton("\u2302  Home")
         self.home_btn.clicked.connect(self.go_home)
         self.home_btn.groupDropped.connect(self._drop_group_top)
-        self.home_btn.setToolTip("Go home \u00b7 or drop a group here to move it to the top")
+        self.home_btn.foldersDropped.connect(self._drop_folders_top)
+        self.home_btn.setToolTip("Go home \u00b7 or drop groups/folders here to move them to the top")
         cl.addWidget(self.home_btn, 0)
         self.crumb_label = QLabel("")
         self.crumb_label.setObjectName("crumbLabel")
@@ -2009,7 +2191,15 @@ class MainWindow(QMainWindow):
         self.grid_host = QWidget()
         self.flow = FlowLayout(self.grid_host, margin=16, spacing=14)
         self.scroll.setWidget(self.grid_host)
-        outer.addWidget(self.scroll, 1)
+        # transparent so the wallpaper behind shows through the gaps between tiles
+        self.scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}")
+        self.scroll.viewport().setStyleSheet("background:transparent;")
+        self.grid_host.setStyleSheet("background:transparent;")
+        self.canvas = WallpaperWidget()
+        canvas_lay = QVBoxLayout(self.canvas)
+        canvas_lay.setContentsMargins(0, 0, 0, 0)
+        canvas_lay.addWidget(self.scroll)
+        outer.addWidget(self.canvas, 1)
 
         self.empty_lbl = QLabel(
             "No folders yet.\n\nClick \u201cAdd folder\u201d, give it a name and a path\n"
@@ -2115,9 +2305,12 @@ class MainWindow(QMainWindow):
             tile.addToGroupRequested.connect(self.add_to_group)
             tile.newGroupForRequested.connect(self.add_to_new_group)
             tile.refreshCoverRequested.connect(self.refresh_cover)
+            tile.foldersDroppedOnFolder.connect(self.nest_folders_into_folder)
+            tile.drag_ids_provider = self._drag_ids_for
             self.tiles[mapping.id] = tile
         else:
             tile.mapping = mapping
+            tile.drag_ids_provider = self._drag_ids_for
         tile.available_groups = self.groups
         tile.refresh()
         return tile
@@ -2134,6 +2327,7 @@ class MainWindow(QMainWindow):
             gt.moveUpRequested.connect(self.move_group_up)
             gt.moveTopRequested.connect(self.move_group_top)
             gt.reparentRequested.connect(self.reparent_group)
+            gt.foldersDroppedOnGroup.connect(self.add_folders_to_group)
             gt.validate_drop = self._can_reparent
             self.group_tiles[group.id] = gt
         else:
@@ -2515,6 +2709,68 @@ class MainWindow(QMainWindow):
             self.move_group_top(g)
             self.log(f"Moved group \u201c{g.name}\u201d to the top level")
 
+    # ---- folder drag-and-drop ----
+    def _drag_ids_for(self, mid):
+        """Which folders to drag: the whole selection if this tile is in it."""
+        if mid in self.selected_ids and len(self.selected_ids) > 1:
+            return list(self.selected_ids)
+        return [mid]
+
+    def nest_folders_into_folder(self, ids, target):
+        """Drop folders onto another folder -> make a new group holding all of them."""
+        ids = [i for i in ids if i != target.id]
+        if not ids:
+            return
+        if not self._can_nest_here():
+            QMessageBox.information(
+                self, APP_NAME, f"Maximum nesting is {MAX_GROUP_DEPTH} levels deep.")
+            return
+        name, ok = QInputDialog.getText(
+            self, "New group", "Name this group:", text="New Group")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        pid = "" if self.current_group is None else self.current_group
+        gid = self._make_group(name, pid)
+        target.group = gid
+        for i in ids:
+            m = self._mapping_by_id(i)
+            if m:
+                m.group = gid
+        self.clear_selection()
+        self._after_change()
+        self.log(f"Grouped {len(ids) + 1} folder(s) into \u201c{name}\u201d")
+
+    def add_folders_to_group(self, ids, group):
+        """Drop folders onto a group tile -> add them to that group."""
+        n = 0
+        for i in ids:
+            m = self._mapping_by_id(i)
+            if m and m.group != group.id:
+                m.group = group.id
+                n += 1
+        self.clear_selection()
+        self._after_change()
+        if n:
+            self.log(f"Moved {n} folder(s) into \u201c{group.name}\u201d")
+
+    def _drop_folders_up(self, ids):
+        for i in ids:
+            m = self._mapping_by_id(i)
+            if m and m.group:
+                g = self._group_by_id(m.group)
+                m.group = g.parent if (g and g.parent) else ""
+        self.clear_selection()
+        self._after_change()
+
+    def _drop_folders_top(self, ids):
+        for i in ids:
+            m = self._mapping_by_id(i)
+            if m:
+                m.group = ""
+        self.clear_selection()
+        self._after_change()
+
     def rename_group(self, group):
         name, ok = QInputDialog.getText(
             self, "Rename group", "Group name:", text=group.name)
@@ -2879,8 +3135,18 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             self.settings.update(dlg.values())
             self._apply_timer()
+            self._apply_wallpaper()
             self._save()
             self.recheck_all()
+
+    def _apply_wallpaper(self):
+        path = self.settings.get("background_image", "")
+        pm = None
+        if path and os.path.isfile(path):
+            loaded = QPixmap(path)
+            if not loaded.isNull():
+                pm = loaded
+        self.canvas.set_wallpaper(pm)
 
     def toggle_log(self):
         self.log_view.setVisible(not self.log_view.isVisible())
