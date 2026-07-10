@@ -96,12 +96,19 @@ VIDEO_EXTS = {
     ".mpg", ".mpeg", ".m2ts", ".mts", ".ts", ".3gp", ".3g2", ".ogv", ".vob",
 }
 
-MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS
+AUDIO_EXTS = {
+    ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".alac",
+    ".wav", ".wma", ".aiff", ".aif", ".wv", ".ape", ".mka", ".mid",
+    ".midi", ".amr", ".ac3", ".dts", ".pcm", ".caf", ".mp2", ".spx",
+    ".dsf", ".dff", ".ra", ".ram",
+}
+
+MEDIA_EXTS = IMAGE_EXTS | VIDEO_EXTS | AUDIO_EXTS
 
 DEFAULT_SETTINGS = {
     "mode": "move",            # "move" or "copy"
     "collision": "rename",     # "rename" | "skip" | "overwrite"
-    "media_only": True,        # if True, non-media (non image/video) files are skipped
+    "media_only": True,        # if True, non-media (non image/video/audio) files are skipped
     "confirm_each": False,     # if True, ask before every drop
     "auto_check_seconds": 20,  # how often to re-check reachability
     "background_image": "",    # optional home-screen wallpaper path
@@ -320,6 +327,10 @@ def is_video(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in VIDEO_EXTS
 
 
+def is_audio(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in AUDIO_EXTS
+
+
 def is_media(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in MEDIA_EXTS
 
@@ -531,6 +542,101 @@ def transfer_one(src, dst, mode, progress_cb=None):
             progress_cb(size, size)
     if mode == "move":
         os.remove(src)
+
+
+def path_size(p) -> int:
+    """Total bytes of a file, or of an entire directory tree."""
+    try:
+        if os.path.isdir(p):
+            total = 0
+            for root, _dirs, files in os.walk(p):
+                for f in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+            return total
+        return os.path.getsize(p)
+    except OSError:
+        return 0
+
+
+def resolve_destination_dir(folder: str, name: str, collision: str):
+    """Decide the final path for a dropped folder landing in `folder`.
+    Returns a path, or None meaning "skip"."""
+    target = os.path.join(folder, name)
+    if not os.path.exists(target):
+        return target
+    if collision == "skip":
+        return None
+    if collision == "overwrite":
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+            else:
+                os.remove(target)
+        except OSError:
+            pass
+        return target
+    i = 1
+    while True:
+        cand = os.path.join(folder, f"{name} ({i})")
+        if not os.path.exists(cand):
+            return cand
+        i += 1
+
+
+def transfer_dir(src, dst, mode, progress_cb=None):
+    """Move or copy an entire folder tree (all files + subfolders) into dst.
+    progress_cb(copied_bytes, total_bytes) reports cumulative progress."""
+    total = path_size(src)
+    state = {"copied": 0}
+    if progress_cb:
+        progress_cb(0, total)
+    if mode == "move":
+        try:
+            os.rename(src, dst)          # same volume: instant tree move
+            if progress_cb:
+                progress_cb(total, total)
+            return
+        except OSError:
+            pass                         # cross-volume: copy the tree, then remove
+
+    def _copyfile(s, d, follow_symlinks=True):
+        try:
+            sz = os.path.getsize(s)
+        except OSError:
+            sz = 0
+        if sz >= BIG_FILE_BYTES:
+            with open(s, "rb") as fs, open(d, "wb") as fd:
+                while True:
+                    buf = fs.read(1024 * 1024)
+                    if not buf:
+                        break
+                    fd.write(buf)
+                    state["copied"] += len(buf)
+                    if progress_cb:
+                        progress_cb(state["copied"], total)
+        else:
+            shutil.copyfile(s, d)
+            state["copied"] += sz
+            if progress_cb:
+                progress_cb(state["copied"], total)
+        try:
+            shutil.copystat(s, d)
+        except OSError:
+            pass
+        return d
+
+    try:
+        shutil.copytree(src, dst, copy_function=_copyfile)
+    except Exception:
+        shutil.rmtree(dst, ignore_errors=True)   # clean a partial copy
+        raise
+    if progress_cb:
+        progress_cb(total, total)
+    if mode == "move":
+        shutil.rmtree(src, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -1188,7 +1294,7 @@ class ActiveZone(QFrame):
         header.addWidget(self.next_btn, 0)
         root.addLayout(header)
 
-        self.hint = QLabel("Drag images or videos here to file them into the active target")
+        self.hint = QLabel("Drag files here to file them into the active target")
         self.hint.setObjectName("activeHint")
         self.hint.setAlignment(Qt.AlignCenter)
         root.addWidget(self.hint, 1)
@@ -1199,7 +1305,7 @@ class ActiveZone(QFrame):
         self._mapping = mapping
         if mapping:
             self.title.setText(f"Active target:  {mapping.name}")
-            self.hint.setText(f"Drop images or videos here  \u2192  {mapping.path}")
+            self.hint.setText(f"Drop files here  \u2192  {mapping.path}")
         else:
             self.title.setText("No target selected")
             self.hint.setText("Add a folder, then pick it here to start filing")
@@ -1285,10 +1391,7 @@ class TransferManager(QThread):
         total = len(files)
         total_bytes = 0
         for s in files:
-            try:
-                total_bytes += os.path.getsize(s)
-            except OSError:
-                pass
+            total_bytes += path_size(s)
         self.signals.started.emit(name, total, total_bytes)
         ok = 0
         skipped = 0
@@ -1296,28 +1399,41 @@ class TransferManager(QThread):
         undo = []
 
         for i, src in enumerate(files, start=1):
-            base = os.path.basename(src)
+            is_dir = os.path.isdir(src)
+            base = os.path.basename(src.rstrip("\\/")) or src
             self.signals.progress.emit(i - 1, total, base)
             final = None
             try:
-                final = resolve_destination(dest, base, collision)
-                if final is None:
-                    skipped += 1
-                    self.signals.log.emit(f"Skipped (already exists): {base}")
-                    continue
-                if os.path.exists(final):       # overwrite mode
-                    os.remove(final)
                 cb = (lambda copied, tot, _b=base:
                       self.signals.fileProgress.emit(_b, copied, tot))
-                transfer_one(src, final, mode, cb)
+                if is_dir:
+                    final = resolve_destination_dir(dest, base, collision)
+                    if final is None:
+                        skipped += 1
+                        self.signals.log.emit(f"Skipped (folder exists): {base}")
+                        continue
+                    transfer_dir(src, final, mode, cb)
+                    undo.append({"mode": mode, "src": src, "dest": final, "is_dir": True})
+                else:
+                    final = resolve_destination(dest, base, collision)
+                    if final is None:
+                        skipped += 1
+                        self.signals.log.emit(f"Skipped (already exists): {base}")
+                        continue
+                    if os.path.exists(final):       # overwrite mode
+                        os.remove(final)
+                    transfer_one(src, final, mode, cb)
+                    undo.append({"mode": mode, "src": src, "dest": final})
                 ok += 1
-                undo.append({"mode": mode, "src": src, "dest": final})
             except Exception as e:
                 errors.append((base, str(e)))
-                # best-effort: clean a partial file we created
+                # best-effort: clean a partial copy we created
                 try:
-                    if final and os.path.exists(final) and mode == "copy":
-                        os.remove(final)
+                    if final and mode == "copy" and os.path.exists(final):
+                        if os.path.isdir(final):
+                            shutil.rmtree(final, ignore_errors=True)
+                        else:
+                            os.remove(final)
                 except Exception:
                     pass
                 self.signals.log.emit(f"FAILED {base}: {e}")
@@ -1333,15 +1449,13 @@ class TransferManager(QThread):
         total = len(records)
         total_bytes = 0
         for rec in records:
-            try:
-                total_bytes += os.path.getsize(rec["dest"])
-            except OSError:
-                pass
+            total_bytes += path_size(rec["dest"])
         self.signals.started.emit(batch.get("name", "Undo"), total, total_bytes)
         restored = 0
         errors = []
         for i, rec in enumerate(reversed(records), start=1):
-            base = os.path.basename(rec["dest"])
+            base = os.path.basename(rec["dest"].rstrip("\\/")) or rec["dest"]
+            is_dir = rec.get("is_dir", False)
             self.signals.progress.emit(i - 1, total, base)
             try:
                 if rec["mode"] == "move":
@@ -1349,14 +1463,20 @@ class TransferManager(QThread):
                     if os.path.exists(rec["dest"]):
                         cb = (lambda copied, tot, _b=base:
                               self.signals.fileProgress.emit(_b, copied, tot))
-                        transfer_one(rec["dest"], rec["src"], "move", cb)
+                        if is_dir:
+                            transfer_dir(rec["dest"], rec["src"], "move", cb)
+                        else:
+                            transfer_one(rec["dest"], rec["src"], "move", cb)
                         restored += 1
                 else:  # copy -> remove the copy we made
                     if os.path.exists(rec["dest"]):
-                        os.remove(rec["dest"])
+                        if is_dir:
+                            shutil.rmtree(rec["dest"], ignore_errors=True)
+                        else:
+                            os.remove(rec["dest"])
                         restored += 1
             except Exception as e:
-                errors.append((os.path.basename(rec["dest"]), str(e)))
+                errors.append((base, str(e)))
                 self.signals.log.emit(f"Undo failed for {rec['dest']}: {e}")
         self.signals.progress.emit(total, total, "")
         self.signals.batchDone.emit({
@@ -1894,7 +2014,7 @@ class SettingsDialog(QDialog):
         form.addRow("If a file already exists", self.collision)
 
         self.media_only = QCheckBox(
-            "Only file image & video types (skip other files in a drop)")
+            "Only file media types \u2014 images, videos & audio (skip other files in a drop)")
         self.media_only.setChecked(bool(settings.get("media_only", True)))
         form.addRow(self.media_only)
 
@@ -2531,7 +2651,7 @@ class MainWindow(QMainWindow):
         return (
             "No folders yet.\n\nClick \u201cAdd folder\u201d, give it a name and a path\n"
             "(local like D:\\Pics\\Funny, or network like \\\\NAS\\share\\Funny),\n"
-            "then drag images or videos onto its tile."
+            "then drag files onto its tile."
         )
 
     def resizeEvent(self, e):
@@ -3032,24 +3152,23 @@ class MainWindow(QMainWindow):
 
     # ---- the drop -> transfer ----
     def handle_drop(self, mapping, paths):
-        files, skipped_dirs, skipped_type = [], 0, 0
+        items, dirs, skipped_type = [], 0, 0
         media_only = self.settings.get("media_only", True)
         for p in paths:
             if os.path.isdir(p):
-                skipped_dirs += 1
+                items.append(p)      # whole folder + contents + subfolders
+                dirs += 1
                 continue
             if media_only and not is_media(p):
                 skipped_type += 1
                 continue
-            files.append(p)
+            items.append(p)
 
         notes = []
-        if skipped_dirs:
-            notes.append(f"{skipped_dirs} folder(s) skipped")
         if skipped_type:
             notes.append(f"{skipped_type} non-media file(s) skipped")
 
-        if not files:
+        if not items:
             msg = "Nothing to file."
             if notes:
                 msg += " (" + ", ".join(notes) + ")"
@@ -3061,7 +3180,7 @@ class MainWindow(QMainWindow):
             if tile:
                 tile.set_reachable(False)
             self.log(f"ERROR: \u201c{mapping.name}\u201d not reachable ({mapping.path}) "
-                     f"\u2014 {len(files)} file(s) not moved")
+                     f"\u2014 {len(items)} item(s) not moved")
             QMessageBox.warning(
                 self, "Drive not reachable",
                 f"\u201c{mapping.name}\u201d could not be reached:\n\n{mapping.path}\n\n"
@@ -3071,31 +3190,42 @@ class MainWindow(QMainWindow):
             return
 
         mode = self.settings.get("mode", "move")
+        n_files = len(items) - dirs
         if self.settings.get("confirm_each", False):
             verb = "Move" if mode == "move" else "Copy"
+            what = []
+            if n_files:
+                what.append(f"{n_files} file(s)")
+            if dirs:
+                what.append(f"{dirs} folder(s)")
             if QMessageBox.question(
                 self, APP_NAME,
-                f"{verb} {len(files)} file(s) to \u201c{mapping.name}\u201d?\n{mapping.path}",
+                f"{verb} {' and '.join(what)} to \u201c{mapping.name}\u201d?\n{mapping.path}",
             ) != QMessageBox.Yes:
                 return
 
         if notes:
             self.statusBar().showMessage(", ".join(notes), 4000)
 
-        self.progress.setRange(0, len(files))
+        self.progress.setRange(0, len(items))
         self.progress.setValue(0)
         self.progress.show()
         self._busy = True
         self.transfer.enqueue({
             "kind": "transfer",
-            "files": files,
+            "files": items,
             "dest": mapping.path,
             "mode": mode,
             "collision": self.settings.get("collision", "rename"),
             "name": mapping.name,
         })
+        what = []
+        if n_files:
+            what.append(f"{n_files} file(s)")
+        if dirs:
+            what.append(f"{dirs} folder(s)")
         self.log(f"{'Moving' if mode == 'move' else 'Copying'} "
-                 f"{len(files)} file(s) -> {mapping.name}")
+                 f"{' + '.join(what)} -> {mapping.name}")
 
     def _on_transfer_started(self, name, total_files, total_bytes):
         big = total_bytes >= SHOW_DIALOG_BYTES or total_files >= SHOW_DIALOG_FILES
