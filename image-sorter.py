@@ -175,6 +175,7 @@ class Group:
     name: str
     color: str = "#64748b"
     parent: str = ""           # parent group id, "" = top level
+    path: str = ""             # optional destination folder; when set, files can be dropped here
 
     @staticmethod
     def from_dict(d: dict) -> "Group":
@@ -183,6 +184,7 @@ class Group:
             name=str(d.get("name", "")).strip(),
             color=str(d.get("color") or "#64748b"),
             parent=str(d.get("parent", "")).strip(),
+            path=str(d.get("path", "")).strip(),
         )
 
 
@@ -1031,6 +1033,7 @@ class GroupTile(QFrame):
     moveTopRequested = Signal(object)
     reparentRequested = Signal(str, str)    # source group id, target (new parent) id
     foldersDroppedOnGroup = Signal(list, object)   # (dragged folder ids, this Group)
+    filesDroppedOnGroup = Signal(object, list)     # (Group, [file paths]) - OS file drop
 
     def __init__(self, group: "Group"):
         super().__init__()
@@ -1098,8 +1101,14 @@ class GroupTile(QFrame):
         )
         fm = QFontMetrics(self.name_lbl.font())
         self.name_lbl.setText(fm.elidedText(name, Qt.ElideRight, TILE_W - 22))
-        self.setToolTip(f"Group: {name}\nDouble-click to open \u00b7 drag onto another "
-                        f"group to nest it")
+        if self.group.path:
+            self.hint.setText("drop files here \u00b7 double-click to open")
+            self.setToolTip(f"Group: {name}\n{self.group.path}\n"
+                            f"Drop files to file them here \u00b7 double-click to open")
+        else:
+            self.hint.setText("double-click to open")
+            self.setToolTip(f"Group: {name}\nDouble-click to open \u00b7 "
+                            f"set a path in the right-click menu to accept files")
         self._apply_style()
 
     def _apply_style(self):
@@ -1157,15 +1166,21 @@ class GroupTile(QFrame):
     def _folders_ok(self, e):
         return bool(decode_folder_ids(e.mimeData()))
 
+    def _accepts_any(self, e):
+        md = e.mimeData()
+        return (self._group_ok(self._dragged_group(e))
+                or self._folders_ok(e)
+                or md.hasUrls())
+
     def dragEnterEvent(self, e):
-        if self._group_ok(self._dragged_group(e)) or self._folders_ok(e):
+        if self._accepts_any(e):
             e.acceptProposedAction()
             self._set_drop_hover(True)
         else:
             e.ignore()
 
     def dragMoveEvent(self, e):
-        if self._group_ok(self._dragged_group(e)) or self._folders_ok(e):
+        if self._accepts_any(e):
             e.acceptProposedAction()
         else:
             e.ignore()
@@ -1175,27 +1190,44 @@ class GroupTile(QFrame):
 
     def dropEvent(self, e):
         self._set_drop_hover(False)
+        md = e.mimeData()
         src = self._dragged_group(e)
         if self._group_ok(src):
             e.acceptProposedAction()
             self.reparentRequested.emit(src, self.group.id)
             return
-        ids = decode_folder_ids(e.mimeData())
+        ids = decode_folder_ids(md)
         if ids:
             e.acceptProposedAction()
             self.foldersDroppedOnGroup.emit(ids, self.group)
             return
+        if md.hasUrls():
+            paths = extract_local_files(md)
+            if paths:
+                e.acceptProposedAction()
+                self.filesDroppedOnGroup.emit(self.group, paths)
+                return
         e.ignore()
+
+    setPathRequested = Signal(object)
+    openPathRequested = Signal(object)
 
     def _menu(self, pos):
         menu = QMenu(self)
-        menu.addAction("Open", lambda: self.enterRequested.emit(self.group))
+        menu.addAction("Open group", lambda: self.enterRequested.emit(self.group))
+        if self.group.path:
+            menu.addAction("Open destination folder",
+                           lambda: self.openPathRequested.emit(self.group))
         sub = menu.addAction("New subgroup\u2026",
                              lambda: self.newSubgroupRequested.emit(self.group))
         sub.setEnabled(self.can_nest)
         if not self.can_nest:
             sub.setToolTip("Maximum nesting depth reached")
         menu.addSeparator()
+        path_label = ("Change folder path\u2026" if self.group.path
+                      else "Set folder path\u2026 (to accept file drops)")
+        menu.addAction(path_label,
+                       lambda: self.setPathRequested.emit(self.group))
         menu.addAction("Rename\u2026", lambda: self.renameRequested.emit(self.group))
         menu.addAction("Change color\u2026", lambda: self.recolorRequested.emit(self.group))
         if self.has_parent:
@@ -2531,6 +2563,9 @@ class MainWindow(QMainWindow):
             gt.moveTopRequested.connect(self.move_group_top)
             gt.reparentRequested.connect(self.reparent_group)
             gt.foldersDroppedOnGroup.connect(self.add_folders_to_group)
+            gt.filesDroppedOnGroup.connect(self.handle_group_file_drop)
+            gt.setPathRequested.connect(self.set_group_path)
+            gt.openPathRequested.connect(self.open_group_path)
             gt.validate_drop = self._can_reparent
             self.group_tiles[group.id] = gt
         else:
@@ -2737,10 +2772,11 @@ class MainWindow(QMainWindow):
     def _selected_mappings(self):
         return [m for m in self.mappings if m.id in self.selected_ids]
 
-    def _make_group(self, name, parent_pid):
+    def _make_group(self, name, parent_pid, path=""):
         gid = uuid.uuid4().hex
         color = TILE_PALETTE[len(self.groups) % len(TILE_PALETTE)]
-        self.groups.append(Group(id=gid, name=name, color=color, parent=parent_pid))
+        self.groups.append(Group(id=gid, name=name, color=color,
+                                 parent=parent_pid, path=path))
         return gid
 
     def _new_group_from_selection(self):
@@ -2991,6 +3027,53 @@ class MainWindow(QMainWindow):
         self._after_change()
         if n:
             self.log(f"Moved {n} folder(s) to the top level")
+
+    # ---- group as a file destination ----
+    def handle_group_file_drop(self, group, paths):
+        """Files dropped onto a group tile from the OS."""
+        if not group.path:
+            # Prompt the user to set a path
+            r = QMessageBox.question(
+                self, APP_NAME,
+                f"Group \u201c{group.name}\u201d has no folder path set.\n\n"
+                f"Would you like to set a destination folder now so files "
+                f"can be dropped here?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+            if r != QMessageBox.Yes:
+                return
+            d = QFileDialog.getExistingDirectory(
+                self, f"Set destination for \u201c{group.name}\u201d",
+                os.path.expanduser("~"))
+            if not d:
+                return
+            group.path = os.path.normpath(d)
+            self._after_change()
+            self.log(f"Set path for group \u201c{group.name}\u201d: {group.path}")
+        # Now file the dropped items using the same logic as folder tiles
+        m = Mapping(id=f"_grp_{group.id}", name=group.name, path=group.path)
+        self.handle_drop(m, paths)
+
+    def set_group_path(self, group):
+        d = QFileDialog.getExistingDirectory(
+            self, f"Set destination for \u201c{group.name}\u201d",
+            group.path or os.path.expanduser("~"))
+        if d:
+            group.path = os.path.normpath(d)
+            self._after_change()
+            self.log(f"Set path for group \u201c{group.name}\u201d: {group.path}")
+
+    def open_group_path(self, group):
+        if group.path:
+            import subprocess
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(group.path)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", group.path])
+                else:
+                    subprocess.Popen(["xdg-open", group.path])
+            except Exception as e:
+                QMessageBox.warning(self, APP_NAME, f"Could not open folder:\n{e}")
 
     def rename_group(self, group):
         old = group.name
